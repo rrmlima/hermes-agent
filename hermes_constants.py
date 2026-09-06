@@ -1046,8 +1046,21 @@ def _detect_container() -> bool:
         or _proc_file_has_marker("/proc/1/cgroup", ("docker", "podman", "/lxc/", "kubepods", "containerd", "crio"))
     ):
         return True
-    # cgroup v2: /proc/1/cgroup is just "0::/"; the runtime still shows in mountinfo.
-    return _proc_file_has_marker("/proc/self/mountinfo", ("kubepods", "containerd", "crio"))
+    # In cgroup v2, /proc/1/cgroup can be marker-free. Inside a container,
+    # the runtime marker appears on the root mount; host child mounts do not count.
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                fields = line.split()
+                if (
+                    len(fields) >= 5
+                    and fields[4] == "/"
+                    and any(marker in line for marker in ("kubepods", "containerd", "crio"))
+                ):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def get_config_path() -> Path:
