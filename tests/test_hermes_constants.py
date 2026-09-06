@@ -393,6 +393,32 @@ class TestIsContainer:
         assert is_container() is False
 
 
+    def test_detects_containerd_root_mount(self, monkeypatch):
+        """A containerd marker on the root mount identifies a real container."""
+        import builtins
+        import io
+
+        self._reset_cache(monkeypatch)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        proc_files = {
+            "/proc/1/cgroup": "0::/\n",
+            "/proc/self/mountinfo": (
+                "36 25 0:42 / / rw,relatime - overlay overlay "
+                "rw,lowerdir=/var/lib/containerd/"
+                "io.containerd.snapshotter.v1.overlayfs/snapshots/123/fs\n"
+            ),
+        }
+
+        monkeypatch.setattr(
+            builtins,
+            "open",
+            lambda path, *args, **kwargs: io.StringIO(proc_files[path]),
+        )
+
+        assert is_container() is True
+
+
     def test_caches_result(self, monkeypatch):
         """Second call uses cached value without re-probing."""
         monkeypatch.setattr(hermes_constants, "_container_detected", True)
