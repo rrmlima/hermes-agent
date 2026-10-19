@@ -26,7 +26,15 @@ class TestImmediateSendLifecycle:
                 "jsonrpc": "2.0", "id": "can-1", "method": "CancelTask", "params": {"id": "t-cancel"}
             })
             assert cancel_resp["result"]["status"]["state"] == protocol.STATE_CANCELED
-            assert not fut.done()  # future not contaminated
+            assert fut.result(timeout=0) == (protocol.STATE_CANCELED, "")
+            assert "t-cancel" not in adapter._pending
+
+            next_future = adapter._add_pending("t-next", "ctx-c")
+            await adapter.send("ctx-c", "late canceled reply", reply_to="t-cancel", metadata={"notify": True})
+            assert not next_future.done()
+            await adapter.send("ctx-c", "next reply", reply_to="t-next", metadata={"notify": True})
+            assert next_future.result(timeout=0) == (protocol.STATE_COMPLETED, "next reply")
+            adapter._pop_pending("t-next")
             await adapter.disconnect()
 
         asyncio.run(run())
@@ -79,3 +87,165 @@ class TestImmediateSendLifecycle:
                 await adapter.disconnect()
 
         asyncio.run(run())
+
+    def test_cancelled_task_ignores_late_completion(self, monkeypatch):
+        adapter, _base = _make_live_adapter(monkeypatch)
+        settlement_jobs = []
+        monkeypatch.setattr(adapter_module, "_daemon_thread", lambda target, _name: settlement_jobs.append(target))
+        pushes = []
+        monkeypatch.setattr(adapter, "_send_push_notification", lambda *args: pushes.append(args))
+        context_id, task_id = "ctx-cancel-late", "task-cancel-late"
+        rec = adapter.tasks.create(task_id, context_id, "peer")
+        future = adapter._add_pending(task_id, context_id)
+        pending = {"task_id": task_id, "context_id": context_id, "peer": "peer", "future": future,
+                   "created_iso": rec["created_iso"], "started": rec["created_at"]}
+        adapter._watch_pending_task(pending)
+        metrics = protocol.metrics
+        before = (metrics.outbound_total, metrics.tasks_completed, metrics.tasks_failed)
+
+        assert adapter.tasks.complete(task_id, protocol.STATE_CANCELED, "") is not None
+        adapter._resolve_task(task_id, protocol.STATE_CANCELED, "")
+        adapter._pop_pending(task_id)
+        for job in settlement_jobs:
+            job()
+        adapter._finalize_task(pending, protocol.STATE_COMPLETED, "late result")
+
+        assert adapter.tasks.get(task_id)["state"] == protocol.STATE_CANCELED
+        assert not any(m.get("task_id") == task_id and m.get("role") == "agent"
+                       for m in protocol.load_conversation(context_id))
+        assert (metrics.outbound_total, metrics.tasks_completed, metrics.tasks_failed) == before
+        assert pushes == []
+        assert task_id not in adapter._pending
+
+    def test_hard_timed_out_task_ignores_late_completion(self, monkeypatch):
+        adapter, _base = _make_live_adapter(monkeypatch)
+        settlement_jobs = []
+        monkeypatch.setattr(adapter_module, "_daemon_thread", lambda target, _name: settlement_jobs.append(target))
+        pushes = []
+        monkeypatch.setattr(adapter, "_send_push_notification", lambda *args: pushes.append(args))
+        monkeypatch.setattr(adapter, "_task_timeout", lambda: 1.0)
+        context_id, task_id = "ctx-timeout-late", "task-timeout-late"
+        rec = adapter.tasks.create(task_id, context_id, "peer")
+        future = adapter._add_pending(task_id, context_id)
+        pending = {"task_id": task_id, "context_id": context_id, "peer": "peer", "future": future,
+                   "created_iso": rec["created_iso"], "started": rec["created_at"]}
+        adapter._watch_pending_task(pending)
+        with adapter.tasks._lock:
+            adapter.tasks._tasks[task_id]["created_at"] = 0.0
+
+        assert adapter._fail_orphans_once() == [task_id]
+        assert task_id not in adapter._pending
+        before = (protocol.metrics.outbound_total, protocol.metrics.tasks_completed, protocol.metrics.tasks_failed)
+        for job in settlement_jobs:
+            job()
+        adapter._finalize_task(pending, protocol.STATE_COMPLETED, "late result")
+
+        assert adapter.tasks.get(task_id)["state"] == protocol.STATE_FAILED
+        assert not any(m.get("task_id") == task_id and m.get("role") == "agent"
+                       for m in protocol.load_conversation(context_id))
+        assert (protocol.metrics.outbound_total, protocol.metrics.tasks_completed, protocol.metrics.tasks_failed) == before
+        assert pushes == []
+
+    def test_send_correlates_reply_to_task_id_before_context_fifo(self, monkeypatch):
+        adapter, _base = _make_live_adapter(monkeypatch)
+        context_id = "ctx-concurrent"
+        first = adapter._add_pending("task-first", context_id)
+        second = adapter._add_pending("task-second", context_id)
+
+        asyncio.run(adapter.send(context_id, "answer for second", reply_to="task-second", metadata={"notify": True}))
+
+        assert not first.done()
+        assert second.result(timeout=0) == (protocol.STATE_COMPLETED, "answer for second")
+        adapter._pop_pending("task-first")
+        adapter._pop_pending("task-second")
+
+    def test_a2a_settles_all_ids_absorbed_into_one_base_event(self, monkeypatch):
+        from gateway.platforms.base import merge_pending_message_event
+        from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+
+        adapter, _base = _make_live_adapter(monkeypatch)
+        context_id = "ctx-merged"
+        first_id, second_id, third_id = "task-merged-first", "task-merged-second", "task-merged-third"
+        first_future = adapter._add_pending(first_id, context_id)
+        second_future = adapter._add_pending(second_id, context_id)
+        third_future = adapter._add_pending(third_id, context_id)
+        first_event = MessageEvent(text="first part", message_type=MessageType.TEXT, message_id=first_id)
+        second_event = MessageEvent(text="second part", message_type=MessageType.TEXT, message_id=second_id)
+        third_event = MessageEvent(text="third part", message_type=MessageType.TEXT, message_id=third_id)
+        pending = {}
+        merge_pending_message_event(pending, context_id, first_event, merge_text=True)
+        merge_pending_message_event(pending, context_id, second_event, merge_text=True)
+        merge_pending_message_event(pending, context_id, third_event, merge_text=True)
+        merged = pending[context_id]
+        merged._streamed_final_response = "answer to the combined request"
+
+        asyncio.run(adapter.on_processing_complete(merged, ProcessingOutcome.SUCCESS))
+
+        assert first_future.result(timeout=0) == (protocol.STATE_COMPLETED, "answer to the combined request")
+        assert second_future.done()
+        assert second_future.result(timeout=0) == (protocol.STATE_COMPLETED, "answer to the combined request")
+        assert third_future.done()
+        assert third_future.result(timeout=0) == (protocol.STATE_COMPLETED, "answer to the combined request")
+        adapter._pop_pending(first_id)
+        adapter._pop_pending(second_id)
+        adapter._pop_pending(third_id)
+
+    def test_stream_disconnect_leaves_task_working_and_disconnect_drains_pending(self, monkeypatch):
+        adapter, _base = _make_live_adapter(monkeypatch)
+        context_id = "ctx-stream"
+        task_id = "task-stream-disconn"
+        adapter.tasks.create(task_id, context_id, "peer-caller")
+        adapter.tasks.set_state(task_id, protocol.STATE_WORKING)
+        adapter._add_pending(task_id, context_id)
+
+        # Simulate BrokenPipeError in stream handler:
+        with pytest.raises(BrokenPipeError):
+            try:
+                raise BrokenPipeError("client hung up")
+            except (BrokenPipeError, ConnectionResetError):
+                adapter._pop_pending(task_id)
+                raise
+
+        # Task in store must remain working, not failed!
+        rec = adapter.tasks.get(task_id)
+        assert rec["state"] == protocol.STATE_WORKING
+
+        # Now simulate adapter.disconnect()
+        new_fut = adapter._add_pending("task-hung", context_id)
+        asyncio.run(adapter.disconnect())
+
+        assert new_fut.done()
+        assert new_fut.result(timeout=0) == (protocol.STATE_FAILED, "[adapter disconnected]")
+        assert len(adapter._pending) == 0
+
+    def test_task_store_retention_and_profile_scope(self):
+        store = protocol.TaskStore()
+        # Create tasks across two different profiles / agent slugs
+        store.create("task-a1", "ctx-1", "peer", agent_slug="agent-alpha")
+        store.create("task-b1", "ctx-1", "peer", agent_slug="agent-beta")
+        store.complete("task-a1", protocol.STATE_COMPLETED, "alpha reply")
+        store.complete("task-b1", protocol.STATE_COMPLETED, "beta reply")
+
+        # Scoped access isolation
+        assert store.get("task-a1", agent_slug="agent-alpha") is not None
+        assert store.get("task-a1", agent_slug="agent-beta") is None
+        assert store.get("task-b1", agent_slug="agent-beta") is not None
+        assert store.get("task-b1", agent_slug="agent-alpha") is None
+
+        # Retention limit trimming
+        original_max = store._MAX_TERMINAL
+        try:
+            store._MAX_TERMINAL = 3
+            store.create("t1", "ctx", "p")
+            store.create("t2", "ctx", "p")
+            store.create("t3", "ctx", "p")
+            store.create("t4", "ctx", "p")
+            store.complete("t1", protocol.STATE_COMPLETED)
+            store.complete("t2", protocol.STATE_COMPLETED)
+            store.complete("t3", protocol.STATE_COMPLETED)
+            store.complete("t4", protocol.STATE_COMPLETED)
+            # t1 should be trimmed as terminal count exceeded 3
+            assert store.get("t1") is None
+            assert store.get("t4") is not None
+        finally:
+            store._MAX_TERMINAL = original_max

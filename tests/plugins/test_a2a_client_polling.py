@@ -175,3 +175,34 @@ class TestA2aClientPolling:
         assert out.startswith("[peer-vps · context ctx-1 · task task-xyz · unknown]")
         assert "Do not resubmit it" in out
         assert "task_id='task-xyz'" in out
+
+    def test_a2a_call_receipt_persists_correctly_on_final_poll(self, monkeypatch):
+        calls = []
+
+        def fake_fetch_card(base_url, headers, timeout):
+            return {"url": base_url, "supportedInterfaces": [{"protocolBinding": "JSONRPC", "url": base_url + "/rpc"}]}
+
+        def fake_http_post_json(url, body, headers, timeout):
+            calls.append(body["method"])
+            if body["method"] == "SendMessage":
+                return {"result": {"task": {"id": "task-receipt", "contextId": "ctx-receipt",
+                                               "status": {"state": "TASK_STATE_WORKING"}}}}
+            return {"result": {"task": {"id": "task-receipt", "contextId": "ctx-receipt",
+                                           "status": {"state": "TASK_STATE_COMPLETED"},
+                                           "artifacts": [{"parts": [{"text": "receipt finalized"}]}]}}}
+
+        monkeypatch.setattr(tools, "_fetch_card", fake_fetch_card)
+        monkeypatch.setattr(tools, "_http_post_json", fake_http_post_json)
+        monkeypatch.setattr(tools, "_configured_peers", lambda: {
+            "peer-vps": {"url": "http://peer.internal", "timeout": 10},
+        })
+        monkeypatch.setattr(tools, "_sleep", lambda seconds: None)
+
+        persisted = []
+        monkeypatch.setattr(tools.protocol, "persist_message", lambda ctx, role, text, tid: persisted.append((ctx, role, text, tid)))
+
+        out = tools.a2a_call({"agent": "peer-vps", "message": "generate receipt"})
+
+        assert "[peer-vps · context ctx-receipt · task task-receipt · completed]" in out
+        assert "receipt finalized" in out
+        assert any(p[1] == "agent" and p[2] == "receipt finalized" and p[3] == "task-receipt" for p in persisted)
