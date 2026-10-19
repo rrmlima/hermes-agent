@@ -236,17 +236,22 @@ class TestImmediateSendLifecycle:
         assert rec["reply"] == "eventual streaming answer"
 
     def test_rpc_message_stream_disconnect_hands_off_to_watcher(self, monkeypatch):
+        import time as _t
         from tests.waiting import wait_until
+        import plugins.platforms.a2a.adapter as adapter_module
+
+        # Keepalive runs frequently so BrokenPipeError triggers immediately during the wait loop
+        monkeypatch.setattr(adapter_module, "_SSE_KEEPALIVE", 0.05)
         adapter, _base = _make_live_adapter(monkeypatch)
         adapter.tasks.create("t-live-stream", "ctx-live-stream", "peer")
         adapter.tasks.set_state("t-live-stream", protocol.STATE_WORKING)
         fut = adapter._add_pending("t-live-stream", "ctx-live-stream")
         pending = {"task_id": "t-live-stream", "context_id": "ctx-live-stream", "peer": "peer", "future": fut,
-                   "created_iso": "now", "started": 0.0}
+                   "created_iso": "now", "started": _t.time()}
 
         class BrokenHandler:
             def __init__(self):
-                self.count = 0
+                self.flushes = 0
             def _json(self, *a, **k): pass
             def send_response(self, code): pass
             def send_header(self, k, v): pass
@@ -256,18 +261,27 @@ class TestImmediateSendLifecycle:
                 class WFile:
                     def write(self_inner, data): pass
                     def flush(self_inner):
-                        self.count += 1
-                        if self.count > 2:
-                            raise BrokenPipeError("client disconnected")
+                        self.flushes += 1
+                        # Initial task and status updates flush (1, 2); the keepalive in _await_future is 3rd:
+                        if self.flushes >= 3:
+                            raise BrokenPipeError("client disconnected on keepalive")
                 return WFile()
 
+        handler = BrokenHandler()
         monkeypatch.setattr(adapter, "_prepare_task", lambda *a, **k: (None, pending))
-        adapter._rpc_message_stream(BrokenHandler(), "req-1", {"message": {}}, "peer")
+        adapter._rpc_message_stream(handler, "req-1", {"message": {}}, "peer")
 
+        # Proven: broken pipe occurred on keepalive flush
+        assert handler.flushes >= 3
+        # Task must still be in _pending (not prematurely popped!)
+        assert "t-live-stream" in adapter._pending
         assert adapter.tasks.get("t-live-stream")["state"] == protocol.STATE_WORKING
+
+        # Late completion must resolve the task correctly through the watcher:
         adapter._resolve_task("t-live-stream", protocol.STATE_COMPLETED, "eventual answer via real rpc stream")
         wait_until(lambda: (adapter.tasks.get("t-live-stream") or {}).get("state") == protocol.STATE_COMPLETED, timeout=2.0)
         assert adapter.tasks.get("t-live-stream")["reply"] == "eventual answer via real rpc stream"
+        wait_until(lambda: "t-live-stream" not in adapter._pending, timeout=2.0)
 
     def test_task_store_retention_and_profile_scope(self):
         store = protocol.TaskStore()

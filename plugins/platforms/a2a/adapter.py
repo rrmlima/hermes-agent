@@ -794,10 +794,18 @@ class A2AAdapter(BasePlatformAdapter):
                 if pending["future"].done():
                     state, reply = self._finalize_task(pending, *wait_result)
                 else:
-                    # Response timeout or client disconnect during streaming wait:
+                    # Response timeout during streaming wait: hand off to background watcher
                     self._watch_pending_task(pending)
                     pending = None
                     return
+            except (BrokenPipeError, ConnectionResetError):
+                # Client disconnected during wait (e.g. BrokenPipe on keepalive).
+                # Hand off to background watcher WITHOUT popping from _pending so
+                # completion settlement resolves correctly when the agent finishes.
+                self._watch_pending_task(pending)
+                pending = None
+                logger.debug("A2A: stream client disconnected during reply wait")
+                return
             finally:
                 if pending is not None:
                     self._pop_pending(task_id)

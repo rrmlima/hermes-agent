@@ -449,7 +449,7 @@ class TaskStore:
                 tid for tid, rec in self._tasks.items()
                 if rec["state"] not in TERMINAL_STATES
                 and (
-                    (tid not in excluded and now - rec["created_at"] > timeout_seconds)
+                    (tid not in excluded and rec["state"] != STATE_INPUT_REQUIRED and now - rec["created_at"] > timeout_seconds)
                     or (now - rec["created_at"] > hard_timeout)
                 )
             ]
