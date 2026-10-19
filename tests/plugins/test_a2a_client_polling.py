@@ -206,3 +206,22 @@ class TestA2aClientPolling:
         assert "[peer-vps · context ctx-receipt · task task-receipt · completed]" in out
         assert "receipt finalized" in out
         assert any(p[1] == "agent" and p[2] == "receipt finalized" and p[3] == "task-receipt" for p in persisted)
+
+    def test_a2a_orchestrate_classifies_polling_error_as_failure(self, monkeypatch):
+        monkeypatch.setattr(tools, "_configured_peers", lambda: {
+            "p-error": {"url": "http://p-error.internal", "capabilities": ["calc"]},
+        })
+        monkeypatch.setattr(tools, "_fetch_card", lambda url, h, t: {"url": url, "supportedInterfaces": [{"protocolBinding": "JSONRPC", "url": url + "/rpc"}]})
+
+        def fake_post(url, body, h, t):
+            if body["method"] == "SendMessage":
+                return {"result": {"task": {"id": "t-err", "contextId": "ctx-err", "status": {"state": "TASK_STATE_WORKING"}}}}
+            raise tools.urllib.error.HTTPError(url, 500, "internal server error", {}, None)
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        monkeypatch.setattr(tools, "_sleep", lambda s: None)
+
+        res = tools.a2a_orchestrate({"capability": "calc", "message": "sum", "mode": "best"})
+        # Must be treated as failed peers, not a success:
+        assert "All peers failed:" in res
+        assert "p-error" in res

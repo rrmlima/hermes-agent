@@ -398,10 +398,10 @@ class TaskStore:
             return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant)) else None
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
-        """Transition a task to a terminal state. Idempotent."""
+        """Transition a task to a terminal state (or INPUT_REQUIRED). Idempotent."""
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or rec["state"] in TERMINAL_STATES:
+            if not rec or rec["state"] in TERMINAL_STATES or rec["state"] == STATE_INPUT_REQUIRED:
                 return None
             rec.update(state=state, reply=reply, completed_at=time.time())
             watchers = self._watchers.pop(task_id, [])
@@ -444,7 +444,7 @@ class TaskStore:
         with self._lock:
             stale = [
                 tid for tid, rec in self._tasks.items()
-                if rec["state"] not in TERMINAL_STATES and rec["state"] != STATE_INPUT_REQUIRED
+                if rec["state"] not in TERMINAL_STATES
                 and (
                     (tid not in excluded and now - rec["created_at"] > timeout_seconds)
                     or (now - rec["created_at"] > hard_timeout)
@@ -453,7 +453,7 @@ class TaskStore:
         return [tid for tid in stale if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]")]
 
     def _trim_locked(self) -> None:
-        terminal = [tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES]
+        terminal = [tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES or rec["state"] == STATE_INPUT_REQUIRED]
         for tid in terminal[:max(0, len(terminal) - self._MAX_TERMINAL)]:
             self._tasks.pop(tid, None)
 

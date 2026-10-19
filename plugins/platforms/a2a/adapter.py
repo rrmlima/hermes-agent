@@ -321,6 +321,7 @@ class A2AAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        """Shut down the HTTP listener and watchdog. Any active pending futures are drained as FAILED."""
         self._mark_disconnected()
         self._watchdog_stop.set()
         if self._httpd is not None:
@@ -328,13 +329,12 @@ class A2AAdapter(BasePlatformAdapter):
                 self._httpd.shutdown()
                 self._httpd.server_close()
             self._httpd = None
-        # Clean request-ownership without failing in-flight agent turns prematurely.
-        # Cancelled pending futures ensure no callers hang if any remain in memory.
+        # Drain all pending futures so in-flight client threads or watchers are promptly unblocked on shutdown.
         with self._pending_lock:
             self._active_tasks.clear()
             for tid, entry in list(self._pending.items()):
-                fut = entry[1] if isinstance(entry, tuple) else entry
-                if hasattr(fut, "done") and not fut.done():
+                fut = entry[1]
+                if not fut.done():
                     fut.set_result((protocol.STATE_FAILED, "[adapter disconnected]"))
             self._pending.clear()
             self._pending_order.clear()
@@ -364,8 +364,11 @@ class A2AAdapter(BasePlatformAdapter):
         failed = self.tasks.fail_orphans(timeout, exclude=active_tasks, hard_timeout=hard_timeout)
         for tid in failed:
             rec = self.tasks.get(tid) or {}
-            self._resolve_task(tid, protocol.STATE_FAILED, rec.get("reply", "[task orphaned — no reply produced]"))
+            reply_msg = rec.get("reply", "[task orphaned — no reply produced]")
+            self._resolve_task(tid, protocol.STATE_FAILED, reply_msg)
             self._pop_pending(tid)
+            protocol.persist_message(rec.get("context_id", ""), "agent", reply_msg, tid)
+            self._send_push_notification(tid, rec.get("context_id", ""), reply_msg, protocol.STATE_FAILED)
             logger.warning("A2A: orphaned/timed-out task %s marked failed", tid)
             protocol.metrics.tasks_failed += 1
         return failed
@@ -796,9 +799,9 @@ class A2AAdapter(BasePlatformAdapter):
         except (BrokenPipeError, ConnectionResetError):
             if pending is not None:
                 # Do NOT fail an in-flight background task simply because the HTTP stream client
-                # disconnected. The agent turn continues executing and completes via _record_outcome;
-                # only the HTTP request-ownership is released so watchdog can guard if orphaned.
-                self._pop_pending(pending["task_id"])
+                # disconnected. Watch the task so that when its agent turn completes, settlement
+                # records the outcome in TaskStore and delivers any configured push notification.
+                self._watch_pending_task(pending)
             logger.debug("A2A: stream client disconnected")
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
@@ -925,10 +928,20 @@ class A2AAdapter(BasePlatformAdapter):
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
         elif reply_to:
+            if not hasattr(self, "_last_turn_response"):
+                self._last_turn_response = {}
+            self._last_turn_response[chat_id] = content or ""
             if not self._resolve_task(str(reply_to), protocol.STATE_COMPLETED, content or ""):
                 logger.debug("A2A: send() for task %s had no pending waiter", reply_to)
         elif not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
+            if not hasattr(self, "_last_turn_response"):
+                self._last_turn_response = {}
+            self._last_turn_response[chat_id] = content or ""
             logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
+        else:
+            if not hasattr(self, "_last_turn_response"):
+                self._last_turn_response = {}
+            self._last_turn_response[chat_id] = content or ""
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -946,13 +959,11 @@ class A2AAdapter(BasePlatformAdapter):
         if task_ids:
             # A base-adapter busy queue can coalesce multiple messages into one turn. Resolve each
             # accepted A2A task with that combined turn result so none remains stranded in FIFO.
-            # A streamed turn never calls send() with notify=True (the gateway suppresses the
-            # normal final send once streaming delivered the body), so the SUCCESS default must
-            # not resolve with "" — that strands every A2A streaming reply as an empty completed
-            # task (#116944). _streamed_final_response is the same stash _final_text_for_post_turn_hooks
-            # reads for /goal and /loop.
+            # Prefer the final delivered response text from send(), falling back to streamed response stashed.
             _streamed = getattr(event, "_streamed_final_response", "")
-            default = (protocol.STATE_COMPLETED, _streamed if isinstance(_streamed, str) else "")
+            _delivered = getattr(self, "_last_turn_response", {}).get(str(getattr(getattr(event, "source", None), "chat_id", "") or ""))
+            final_text = _delivered if isinstance(_delivered, str) and _delivered else (_streamed if isinstance(_streamed, str) else "")
+            default = (protocol.STATE_COMPLETED, final_text)
             result = {
                 ProcessingOutcome.FAILURE: (protocol.STATE_FAILED, "[agent processing failed]"),
                 ProcessingOutcome.CANCELLED: (protocol.STATE_CANCELED, ""),

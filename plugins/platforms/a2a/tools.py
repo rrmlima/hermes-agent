@@ -280,7 +280,8 @@ def a2a_call(args: dict, **_: Any) -> str:
         error_context_id = reply_ctx
 
         # If a new task was submitted and immediately returned in progress, poll until completion or timeout.
-        if not task_id and state in (protocol.STATE_WORKING, protocol.STATE_SUBMITTED) and effective_task_id:
+        is_working_state = state in (protocol.STATE_WORKING, protocol.STATE_SUBMITTED, "working", "submitted")
+        if not task_id and is_working_state and effective_task_id:
             reply, reply_ctx, state, poll_error = _poll_task_until_terminal(
                 agent, peer, reply, reply_ctx, state, effective_task_id, start_time, total_timeout
             )
@@ -401,7 +402,7 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
             except Exception as e:
                 results.append((name, f"Error: {e}"))
     results.sort(key=lambda r: r[0])  # deterministic output
-    successes = [(name, reply) for name, reply in results if not reply.startswith("Error:") and "· working]" not in reply]
+    successes = [(name, reply) for name, reply in results if not reply.startswith("Error:") and not reply.startswith("[") and "· working]" not in reply and "· unknown]" not in reply]
     if mode in ("best", "first"):
         if not successes:
             return "\n".join(["All peers failed:"] + [f"  {name}: {reply}" for name, reply in results])

@@ -141,10 +141,11 @@ class TestImmediateSendLifecycle:
         adapter._finalize_task(pending, protocol.STATE_COMPLETED, "late result")
 
         assert adapter.tasks.get(task_id)["state"] == protocol.STATE_FAILED
-        assert not any(m.get("task_id") == task_id and m.get("role") == "agent"
-                       for m in protocol.load_conversation(context_id))
+        assert any(m.get("task_id") == task_id and m.get("role") == "agent"
+                   and m.get("text") == "[task orphaned — no reply produced]"
+                   for m in protocol.load_conversation("ctx-timeout-late"))
         assert (protocol.metrics.outbound_total, protocol.metrics.tasks_completed, protocol.metrics.tasks_failed) == before
-        assert pushes == []
+        assert any(p[0] == task_id and p[3] == protocol.STATE_FAILED for p in pushes)
 
     def test_send_correlates_reply_to_task_id_before_context_fifo(self, monkeypatch):
         adapter, _base = _make_live_adapter(monkeypatch)
@@ -177,38 +178,52 @@ class TestImmediateSendLifecycle:
         merge_pending_message_event(pending, context_id, second_event, merge_text=True)
         merge_pending_message_event(pending, context_id, third_event, merge_text=True)
         merged = pending[context_id]
-        merged._streamed_final_response = "answer to the combined request"
+        merged.source = type("Source", (), {"chat_id": context_id})()
 
+        # Gateway executes turn and calls send() on the delivery adapter with notify=True:
+        asyncio.run(adapter.send(context_id, "combined non-streamed answer", reply_to=first_id, metadata={"notify": True}))
+        # Then gateway calls on_processing_complete:
         asyncio.run(adapter.on_processing_complete(merged, ProcessingOutcome.SUCCESS))
 
-        assert first_future.result(timeout=0) == (protocol.STATE_COMPLETED, "answer to the combined request")
+        assert first_future.result(timeout=0) == (protocol.STATE_COMPLETED, "combined non-streamed answer")
         assert second_future.done()
-        assert second_future.result(timeout=0) == (protocol.STATE_COMPLETED, "answer to the combined request")
+        assert second_future.result(timeout=0) == (protocol.STATE_COMPLETED, "combined non-streamed answer")
         assert third_future.done()
-        assert third_future.result(timeout=0) == (protocol.STATE_COMPLETED, "answer to the combined request")
+        assert third_future.result(timeout=0) == (protocol.STATE_COMPLETED, "combined non-streamed answer")
         adapter._pop_pending(first_id)
         adapter._pop_pending(second_id)
         adapter._pop_pending(third_id)
 
     def test_stream_disconnect_leaves_task_working_and_disconnect_drains_pending(self, monkeypatch):
+        from tests.waiting import wait_until
+        import time as _t
         adapter, _base = _make_live_adapter(monkeypatch)
         context_id = "ctx-stream"
         task_id = "task-stream-disconn"
         adapter.tasks.create(task_id, context_id, "peer-caller")
         adapter.tasks.set_state(task_id, protocol.STATE_WORKING)
-        adapter._add_pending(task_id, context_id)
+        fut = adapter._add_pending(task_id, context_id)
+        pending = {"task_id": task_id, "context_id": context_id, "peer": "peer-caller", "future": fut, "started": _t.time()}
 
         # Simulate BrokenPipeError in stream handler:
         with pytest.raises(BrokenPipeError):
             try:
                 raise BrokenPipeError("client hung up")
             except (BrokenPipeError, ConnectionResetError):
-                adapter._pop_pending(task_id)
+                adapter._watch_pending_task(pending)
                 raise
 
-        # Task in store must remain working, not failed!
+        # Task in store must remain working immediately after disconnect:
         rec = adapter.tasks.get(task_id)
         assert rec["state"] == protocol.STATE_WORKING
+
+        # When the agent finishes late, watch callback must settle it to COMPLETED!
+        adapter._resolve_task(task_id, protocol.STATE_COMPLETED, "eventual streaming answer")
+        wait_until(lambda: (adapter.tasks.get(task_id) or {}).get("state") == protocol.STATE_COMPLETED, timeout=2.0)
+
+        rec = adapter.tasks.get(task_id)
+        assert rec["state"] == protocol.STATE_COMPLETED
+        assert rec["reply"] == "eventual streaming answer"
 
         # Now simulate adapter.disconnect()
         new_fut = adapter._add_pending("task-hung", context_id)
@@ -241,11 +256,13 @@ class TestImmediateSendLifecycle:
             store.create("t3", "ctx", "p")
             store.create("t4", "ctx", "p")
             store.complete("t1", protocol.STATE_COMPLETED)
-            store.complete("t2", protocol.STATE_COMPLETED)
+            store.complete("t2", protocol.STATE_INPUT_REQUIRED)
             store.complete("t3", protocol.STATE_COMPLETED)
             store.complete("t4", protocol.STATE_COMPLETED)
-            # t1 should be trimmed as terminal count exceeded 3
+            # t1 should be trimmed as terminal/input-required count exceeded 3
             assert store.get("t1") is None
             assert store.get("t4") is not None
+            # Duplicate completion on input-required task must be rejected:
+            assert store.complete("t2", protocol.STATE_COMPLETED, "duplicate") is None
         finally:
             store._MAX_TERMINAL = original_max
