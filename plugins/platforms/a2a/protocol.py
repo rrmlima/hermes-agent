@@ -417,9 +417,7 @@ class TaskStore:
             if not (rec := self._scoped(task_id, agent_slug, tenant)):
                 return None
             fut: Future = Future()
-            if rec["state"] in TERMINAL_STATES:
-                fut.set_result((rec["state"], rec.get("reply", "")))
-            elif rec["state"] == STATE_INPUT_REQUIRED:
+            if rec["state"] in TERMINAL_STATES or rec["state"] == STATE_INPUT_REQUIRED:
                 fut.set_result((rec["state"], rec.get("reply", "")))
             else:
                 self._watchers.setdefault(task_id, []).append(fut)

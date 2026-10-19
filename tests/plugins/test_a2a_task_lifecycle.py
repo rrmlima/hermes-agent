@@ -20,7 +20,7 @@ class TestImmediateSendLifecycle:
         async def run():
             assert await adapter.connect() is True
             # Create task
-            rec = adapter.tasks.create("t-cancel", "ctx-c", "peer")
+            adapter.tasks.create("t-cancel", "ctx-c", "peer")
             fut = adapter._add_pending("t-cancel", "ctx-c")
             cancel_resp = await asyncio.to_thread(_post_json, base + "/", {
                 "jsonrpc": "2.0", "id": "can-1", "method": "CancelTask", "params": {"id": "t-cancel"}

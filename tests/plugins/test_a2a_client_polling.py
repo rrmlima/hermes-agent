@@ -73,3 +73,105 @@ class TestA2aClientPolling:
         monkeypatch.setattr(tools, "a2a_call", fake_call)
         res = tools.a2a_orchestrate({"capability": "test", "message": "ping", "mode": "all"})
         assert "final result" not in res  # first call was working, so not treated as success
+
+    def test_a2a_call_stops_polling_on_nonretryable_http_error(self, monkeypatch):
+        calls = []
+        clock = {"now": 0.0}
+
+        def fake_fetch_card(base_url, headers, timeout):
+            return {"url": base_url, "supportedInterfaces": [{"protocolBinding": "JSONRPC", "url": base_url + "/rpc"}]}
+
+        def fake_http_post_json(url, body, headers, timeout):
+            calls.append(body["method"])
+            if body["method"] == "SendMessage":
+                return {"result": {"task": {"id": "task-xyz", "contextId": "ctx-1",
+                                               "status": {"state": "TASK_STATE_WORKING"}}}}
+            raise tools.urllib.error.HTTPError(url, 400, "bad request", {}, None)
+
+        monkeypatch.setattr(tools, "_fetch_card", fake_fetch_card)
+        monkeypatch.setattr(tools, "_http_post_json", fake_http_post_json)
+        monkeypatch.setattr(tools, "_configured_peers", lambda: {
+            "peer-vps": {"url": "http://peer.internal", "timeout": 1},
+        })
+        monkeypatch.setattr(tools, "_monotonic", lambda: clock["now"])
+        monkeypatch.setattr(tools, "_sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+
+        out = tools.a2a_call({"agent": "peer-vps", "message": "continue task"})
+
+        assert out.startswith("[peer-vps · context ctx-1 · task task-xyz · unknown]")
+        assert "HTTP 400" in out
+        assert "Do not resubmit it" in out
+        assert "task_id='task-xyz'" in out
+        assert calls == ["SendMessage", "GetTask"]
+
+    def test_a2a_call_retries_transient_http_error(self, monkeypatch):
+        calls = []
+
+        def fake_fetch_card(base_url, headers, timeout):
+            return {"url": base_url, "supportedInterfaces": [{"protocolBinding": "JSONRPC", "url": base_url + "/rpc"}]}
+
+        def fake_http_post_json(url, body, headers, timeout):
+            calls.append(body["method"])
+            if body["method"] == "SendMessage":
+                return {"result": {"task": {"id": "task-xyz", "contextId": "ctx-1",
+                                               "status": {"state": "TASK_STATE_WORKING"}}}}
+            if len(calls) == 2:
+                raise tools.urllib.error.HTTPError(url, 503, "temporarily unavailable", {}, None)
+            return {"result": {"task": {"id": "task-xyz", "contextId": "ctx-1",
+                                           "status": {"state": "TASK_STATE_COMPLETED"},
+                                           "artifacts": [{"parts": [{"text": "done"}]}]}}}
+
+        monkeypatch.setattr(tools, "_fetch_card", fake_fetch_card)
+        monkeypatch.setattr(tools, "_http_post_json", fake_http_post_json)
+        monkeypatch.setattr(tools, "_configured_peers", lambda: {
+            "peer-vps": {"url": "http://peer.internal", "timeout": 10},
+        })
+        monkeypatch.setattr(tools, "_sleep", lambda seconds: None)
+
+        out = tools.a2a_call({"agent": "peer-vps", "message": "continue task"})
+
+        assert "[peer-vps · context ctx-1 · task task-xyz · completed]" in out
+        assert "done" in out
+        assert calls == ["SendMessage", "GetTask", "GetTask"]
+
+    def test_a2a_call_preserves_task_id_when_direct_poll_fails(self, monkeypatch):
+        def fake_fetch_card(base_url, headers, timeout):
+            return {"url": base_url, "supportedInterfaces": [{"protocolBinding": "JSONRPC", "url": base_url + "/rpc"}]}
+
+        def fake_http_post_json(url, body, headers, timeout):
+            raise tools.urllib.error.HTTPError(url, 404, "not found", {}, None)
+
+        monkeypatch.setattr(tools, "_fetch_card", fake_fetch_card)
+        monkeypatch.setattr(tools, "_http_post_json", fake_http_post_json)
+        monkeypatch.setattr(tools, "_configured_peers", lambda: {
+            "peer-vps": {"url": "http://peer.internal", "timeout": 10},
+        })
+
+        out = tools.a2a_call({"agent": "peer-vps", "task_id": "task-xyz", "context_id": "ctx-1"})
+
+        assert out.startswith("[peer-vps · context ctx-1 · task task-xyz · unknown]")
+        assert "HTTP 404" in out
+        assert "task_id='task-xyz'" in out
+
+    def test_a2a_call_preserves_task_id_on_unexpected_poll_error(self, monkeypatch):
+        def fake_fetch_card(base_url, headers, timeout):
+            return {"url": base_url, "supportedInterfaces": [{"protocolBinding": "JSONRPC", "url": base_url + "/rpc"}]}
+
+        def fake_http_post_json(url, body, headers, timeout):
+            if body["method"] == "SendMessage":
+                return {"result": {"task": {"id": "task-xyz", "contextId": "ctx-1",
+                                               "status": {"state": "TASK_STATE_WORKING"}}}}
+            raise RuntimeError("poll implementation error")
+
+        monkeypatch.setattr(tools, "_fetch_card", fake_fetch_card)
+        monkeypatch.setattr(tools, "_http_post_json", fake_http_post_json)
+        monkeypatch.setattr(tools, "_configured_peers", lambda: {
+            "peer-vps": {"url": "http://peer.internal", "timeout": 10},
+        })
+        monkeypatch.setattr(tools, "_sleep", lambda seconds: None)
+
+        out = tools.a2a_call({"agent": "peer-vps", "message": "continue task"})
+
+        assert out.startswith("[peer-vps · context ctx-1 · task task-xyz · unknown]")
+        assert "Do not resubmit it" in out
+        assert "task_id='task-xyz'" in out

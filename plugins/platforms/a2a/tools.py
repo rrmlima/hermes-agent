@@ -21,10 +21,49 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 120
 _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
+_RETRYABLE_POLL_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 # Deterministic clock and sleep seams for testing
 _sleep = time.sleep
 _monotonic = time.monotonic
+
+
+def _task_poll_error(agent: str, context_id: str, task_id: str, reason: str) -> str:
+    context = f" · context {context_id}" if context_id else ""
+    return (f"[{agent}{context} · task {task_id} · unknown]\n"
+            f"Could not verify task status ({reason}); it may still be running. Do not resubmit it. "
+            f"Resume with a2a_call using agent='{agent}' and task_id='{task_id}'.")
+
+
+def _poll_task_until_terminal(agent: str, peer: dict, reply: str, reply_ctx: str, state: str,
+                              task_id: str, start_time: float, total_timeout: int) -> tuple[str, str, str, str]:
+    backoff_schedule = (1.0, 2.0, 3.0, 5.0, 8.0, 10.0)
+    poll_idx = 0
+    last_poll_error = ""
+    while (_monotonic() - start_time) < total_timeout:
+        delay = backoff_schedule[min(poll_idx, len(backoff_schedule) - 1)]
+        remaining = total_timeout - (_monotonic() - start_time)
+        if remaining <= 0:
+            break
+        _sleep(min(delay, remaining))
+        poll_idx += 1
+        try:
+            reply, reply_ctx, state, _ = _send_task(agent, peer, "", reply_ctx, task_id=task_id)
+            last_poll_error = ""
+            if state not in (protocol.STATE_WORKING, protocol.STATE_SUBMITTED, "working", "submitted"):
+                break
+        except urllib.error.HTTPError as poll_err:
+            if poll_err.code not in _RETRYABLE_POLL_HTTP_CODES:
+                return reply, reply_ctx, state, _task_poll_error(agent, reply_ctx, task_id, f"HTTP {poll_err.code}")
+            last_poll_error = f"HTTP {poll_err.code}"
+            logger.debug("A2A: transient HTTP %s while polling task %s", poll_err.code, task_id)
+        except ValueError:
+            return reply, reply_ctx, state, _task_poll_error(agent, reply_ctx, task_id, "invalid peer response")
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as poll_err:
+            last_poll_error = f"transport error ({type(poll_err).__name__})"
+            logger.debug("A2A: transient poll transport error for task %s (%s)", task_id, type(poll_err).__name__)
+    error = _task_poll_error(agent, reply_ctx, task_id, last_poll_error) if last_poll_error else ""
+    return reply, reply_ctx, state, error
 
 
 def _load_config() -> dict:
@@ -232,37 +271,34 @@ def a2a_call(args: dict, **_: Any) -> str:
 
     total_timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
     start_time = _monotonic()
+    effective_task_id = task_id
+    error_context_id = context_id
 
     try:
         reply, reply_ctx, state, assigned_task_id = _send_task(agent, peer, message, context_id, task_id=task_id)
         effective_task_id = task_id or assigned_task_id
+        error_context_id = reply_ctx
 
-        # If a new task was submitted and immediately returned in progress, poll until completion or timeout
+        # If a new task was submitted and immediately returned in progress, poll until completion or timeout.
         if not task_id and state in (protocol.STATE_WORKING, protocol.STATE_SUBMITTED) and effective_task_id:
-            backoff_schedule = [1.0, 2.0, 3.0, 5.0, 8.0, 10.0]
-            poll_idx = 0
-            while (_monotonic() - start_time) < total_timeout:
-                delay = backoff_schedule[min(poll_idx, len(backoff_schedule) - 1)]
-                remaining = total_timeout - (_monotonic() - start_time)
-                if remaining <= 0:
-                    break
-                _sleep(min(delay, remaining))
-                poll_idx += 1
-                try:
-                    p_reply, p_ctx, p_state, _ = _send_task(agent, peer, "", reply_ctx, task_id=effective_task_id)
-                    reply, reply_ctx, state = p_reply, p_ctx, p_state
-                    if state not in (protocol.STATE_WORKING, protocol.STATE_SUBMITTED, "working", "submitted"):
-                        break
-                except Exception as poll_err:
-                    logger.debug("A2A: transient poll error for task %s: %s", effective_task_id, poll_err)
+            reply, reply_ctx, state, poll_error = _poll_task_until_terminal(
+                agent, peer, reply, reply_ctx, state, effective_task_id, start_time, total_timeout
+            )
+            if poll_error:
+                return poll_error
     except urllib.error.HTTPError as e:
+        if effective_task_id:
+            return _task_poll_error(agent, error_context_id, effective_task_id, f"HTTP {e.code}")
         return _HTTP_CALL_ERRORS.get(e.code, "Error: call to '{agent}' failed — HTTP {code}.").format(agent=agent, code=e.code)
     except ValueError as e:
+        if effective_task_id:
+            return _task_poll_error(agent, error_context_id, effective_task_id, "invalid peer response")
         return str(e)
     except Exception as e:
+        if effective_task_id:
+            return _task_poll_error(agent, error_context_id, effective_task_id, "unexpected polling error")
         return f"Error: call to '{agent}' failed — {e}."
 
-    effective_task_id = task_id or assigned_task_id
     short_state = state.replace("TASK_STATE_", "").replace("_", "-").lower()
     header_parts = [agent]
     if reply_ctx:

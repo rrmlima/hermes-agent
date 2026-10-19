@@ -679,7 +679,7 @@ class A2AAdapter(BasePlatformAdapter):
         def on_done(completed: Future) -> None:
             try:
                 state, reply = completed.result()
-            except Exception:
+            except Exception:  # health: allow BLE001 -- sanitize arbitrary agent/provider failures into task state
                 state, reply = protocol.STATE_FAILED, "[agent processing failed]"
 
             profile_context = self._profile_context.copy()
@@ -719,7 +719,7 @@ class A2AAdapter(BasePlatformAdapter):
                 if pending["future"].done():
                     try:
                         outcome = pending["future"].result()
-                    except Exception:
+                    except Exception:  # health: allow BLE001 -- keep safe fallback when a Future carries agent errors
                         outcome = wait_result
                     try:
                         state, reply = self._finalize_task(pending, *outcome)
