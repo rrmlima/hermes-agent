@@ -792,14 +792,18 @@ class A2AAdapter(BasePlatformAdapter):
             try:
                 wait_result = self._await_reply(pending, keepalive=self._keepalive(handler))
                 if pending["future"].done():
-                    state, reply = self._finalize_task(pending, *wait_result)
+                    try:
+                        outcome = pending["future"].result()
+                    except Exception:  # health: allow BLE001 -- keep safe fallback when a Future carries agent errors
+                        outcome = wait_result
+                    state, reply = self._finalize_task(pending, *outcome)
                 else:
                     # Response timeout during streaming wait: hand off to background watcher
                     self._watch_pending_task(pending)
                     pending = None
                     return
-            except (BrokenPipeError, ConnectionResetError):
-                # Client disconnected during wait (e.g. BrokenPipe on keepalive).
+            except (ConnectionError, OSError):
+                # Client disconnected during wait (e.g. BrokenPipe / ConnectionReset / ConnectionAborted on keepalive).
                 # Hand off to background watcher WITHOUT popping from _pending so
                 # completion settlement resolves correctly when the agent finishes.
                 self._watch_pending_task(pending)
@@ -811,7 +815,7 @@ class A2AAdapter(BasePlatformAdapter):
                     self._pop_pending(task_id)
             pending = None
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
-        except (BrokenPipeError, ConnectionResetError):
+        except (ConnectionError, OSError):
             if pending is not None:
                 self._watch_pending_task(pending)
             logger.debug("A2A: stream client disconnected")
@@ -830,7 +834,7 @@ class A2AAdapter(BasePlatformAdapter):
             state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
                                               (rec["state"], rec.get("reply", "")))
             self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
-        except (BrokenPipeError, ConnectionResetError):
+        except (ConnectionError, OSError):
             logger.debug("A2A: subscribe client disconnected")
 
     def _find_task(self, req_id: Any, params: dict, agent: Optional[dict]) -> tuple[str, Optional[dict], Optional[dict]]:
