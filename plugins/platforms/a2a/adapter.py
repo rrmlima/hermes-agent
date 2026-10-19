@@ -281,6 +281,7 @@ class A2AAdapter(BasePlatformAdapter):
         # Admission ids this process already forwarded; a resend of one is a retry, not a new turn.
         self._forwarded_inputs: OrderedDict[str, None] = OrderedDict()
         self._pending_lock = threading.Lock()
+        self._last_turn_response: dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -663,7 +664,8 @@ class A2AAdapter(BasePlatformAdapter):
     @staticmethod
     def _await_future(fut: Future, deadline: float, keepalive, on_timeout: tuple[str, str]) -> tuple[str, str]:
         """Block until ``fut`` resolves or ``deadline`` passes (-> ``on_timeout``). ``keepalive`` runs
-        every _SSE_KEEPALIVE seconds while waiting; if it raises, the client is gone and we stop."""
+        every _SSE_KEEPALIVE seconds while waiting; if it raises, propagate the client disconnect so
+        stream handlers can hand off to background watchers without storing a premature failure."""
         while True:
             try:
                 return fut.result(timeout=_SSE_KEEPALIVE if keepalive else max(0.0, deadline - time.time()))
@@ -671,10 +673,7 @@ class A2AAdapter(BasePlatformAdapter):
                 if time.time() >= deadline:
                     return on_timeout
                 if keepalive:
-                    try:
-                        keepalive()
-                    except Exception:
-                        return (protocol.STATE_FAILED, "[client disconnected]")
+                    keepalive()
             except Exception:
                 return on_timeout
 
@@ -791,16 +790,21 @@ class A2AAdapter(BasePlatformAdapter):
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
             try:
-                state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
+                wait_result = self._await_reply(pending, keepalive=self._keepalive(handler))
+                if pending["future"].done():
+                    state, reply = self._finalize_task(pending, *wait_result)
+                else:
+                    # Response timeout or client disconnect during streaming wait:
+                    self._watch_pending_task(pending)
+                    pending = None
+                    return
             finally:
-                self._pop_pending(task_id)
+                if pending is not None:
+                    self._pop_pending(task_id)
             pending = None
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             if pending is not None:
-                # Do NOT fail an in-flight background task simply because the HTTP stream client
-                # disconnected. Watch the task so that when its agent turn completes, settlement
-                # records the outcome in TaskStore and delivers any configured push notification.
                 self._watch_pending_task(pending)
             logger.debug("A2A: stream client disconnected")
 
@@ -849,7 +853,7 @@ class A2AAdapter(BasePlatformAdapter):
             return error
         if rec["state"] in protocol.TERMINAL_STATES:
             return _err(req_id, protocol.ERR_TASK_NOT_CANCELABLE, f"task {task_id} already {rec['state']}")
-        cancelled = self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
+        cancelled = self.tasks.complete(task_id, protocol.STATE_CANCELED, "", force_terminal=True)
         if cancelled is None:
             current = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
             return _ok(req_id, protocol.TaskStore.to_task(current))
@@ -927,21 +931,13 @@ class A2AAdapter(BasePlatformAdapter):
         fall back to the oldest pending Future for this context."""
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
-        elif reply_to:
-            if not hasattr(self, "_last_turn_response"):
-                self._last_turn_response = {}
-            self._last_turn_response[chat_id] = content or ""
-            if not self._resolve_task(str(reply_to), protocol.STATE_COMPLETED, content or ""):
-                logger.debug("A2A: send() for task %s had no pending waiter", reply_to)
-        elif not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
-            if not hasattr(self, "_last_turn_response"):
-                self._last_turn_response = {}
-            self._last_turn_response[chat_id] = content or ""
-            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
         else:
-            if not hasattr(self, "_last_turn_response"):
-                self._last_turn_response = {}
             self._last_turn_response[chat_id] = content or ""
+            if reply_to:
+                if not self._resolve_task(str(reply_to), protocol.STATE_COMPLETED, content or ""):
+                    logger.debug("A2A: send() for task %s had no pending waiter", reply_to)
+            elif not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
+                logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -956,12 +952,13 @@ class A2AAdapter(BasePlatformAdapter):
         HTTP thread returns promptly."""
         task_id = str(getattr(event, "message_id", "") or "")
         task_ids = list(dict.fromkeys([task_id, *(getattr(event, "merged_message_ids", []) or [])]))
+        chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
         if task_ids:
             # A base-adapter busy queue can coalesce multiple messages into one turn. Resolve each
             # accepted A2A task with that combined turn result so none remains stranded in FIFO.
-            # Prefer the final delivered response text from send(), falling back to streamed response stashed.
+            # Pop the final delivered response text for this chat so stale responses never leak across turns.
             _streamed = getattr(event, "_streamed_final_response", "")
-            _delivered = getattr(self, "_last_turn_response", {}).get(str(getattr(getattr(event, "source", None), "chat_id", "") or ""))
+            _delivered = self._last_turn_response.pop(chat_id, "")
             final_text = _delivered if isinstance(_delivered, str) and _delivered else (_streamed if isinstance(_streamed, str) else "")
             default = (protocol.STATE_COMPLETED, final_text)
             result = {
@@ -970,3 +967,5 @@ class A2AAdapter(BasePlatformAdapter):
             }.get(outcome, default)
             for absorbed_task_id in task_ids:
                 self._resolve_task(absorbed_task_id, *result)
+        else:
+            self._last_turn_response.pop(chat_id, None)

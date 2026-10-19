@@ -402,7 +402,17 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
             except Exception as e:
                 results.append((name, f"Error: {e}"))
     results.sort(key=lambda r: r[0])  # deterministic output
-    successes = [(name, reply) for name, reply in results if not reply.startswith("Error:") and not reply.startswith("[") and "· working]" not in reply and "· unknown]" not in reply]
+    def is_success(name: str, text: str) -> bool:
+        if not text or text.startswith("Error:"):
+            return False
+        # Successful a2a_call format: [name · ... · completed]
+        first_line = text.splitlines()[0].strip() if text else ""
+        if first_line.startswith("[") and first_line.endswith("]"):
+            state_token = first_line[1:-1].split("·")[-1].strip().lower()
+            return state_token in ("completed", "input-required", "done")
+        return False
+
+    successes = [(name, reply) for name, reply in results if is_success(name, reply)]
     if mode in ("best", "first"):
         if not successes:
             return "\n".join(["All peers failed:"] + [f"  {name}: {reply}" for name, reply in results])

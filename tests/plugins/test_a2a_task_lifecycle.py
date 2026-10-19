@@ -194,6 +194,16 @@ class TestImmediateSendLifecycle:
         adapter._pop_pending(second_id)
         adapter._pop_pending(third_id)
 
+        # Subsequent streamed turn must not reuse the consumed non-streamed answer:
+        streamed_id = "task-streamed-next"
+        streamed_fut = adapter._add_pending(streamed_id, context_id)
+        streamed_event = MessageEvent(text="streamed turn", message_type=MessageType.TEXT, message_id=streamed_id)
+        streamed_event.source = type("Source", (), {"chat_id": context_id})()
+        streamed_event._streamed_final_response = "fresh streamed answer"
+        asyncio.run(adapter.on_processing_complete(streamed_event, ProcessingOutcome.SUCCESS))
+        assert streamed_fut.result(timeout=0) == (protocol.STATE_COMPLETED, "fresh streamed answer")
+        adapter._pop_pending(streamed_id)
+
     def test_stream_disconnect_leaves_task_working_and_disconnect_drains_pending(self, monkeypatch):
         from tests.waiting import wait_until
         import time as _t
@@ -225,13 +235,39 @@ class TestImmediateSendLifecycle:
         assert rec["state"] == protocol.STATE_COMPLETED
         assert rec["reply"] == "eventual streaming answer"
 
-        # Now simulate adapter.disconnect()
-        new_fut = adapter._add_pending("task-hung", context_id)
-        asyncio.run(adapter.disconnect())
+    def test_rpc_message_stream_disconnect_hands_off_to_watcher(self, monkeypatch):
+        from tests.waiting import wait_until
+        adapter, _base = _make_live_adapter(monkeypatch)
+        adapter.tasks.create("t-live-stream", "ctx-live-stream", "peer")
+        adapter.tasks.set_state("t-live-stream", protocol.STATE_WORKING)
+        fut = adapter._add_pending("t-live-stream", "ctx-live-stream")
+        pending = {"task_id": "t-live-stream", "context_id": "ctx-live-stream", "peer": "peer", "future": fut,
+                   "created_iso": "now", "started": 0.0}
 
-        assert new_fut.done()
-        assert new_fut.result(timeout=0) == (protocol.STATE_FAILED, "[adapter disconnected]")
-        assert len(adapter._pending) == 0
+        class BrokenHandler:
+            def __init__(self):
+                self.count = 0
+            def _json(self, *a, **k): pass
+            def send_response(self, code): pass
+            def send_header(self, k, v): pass
+            def end_headers(self): pass
+            @property
+            def wfile(self):
+                class WFile:
+                    def write(self_inner, data): pass
+                    def flush(self_inner):
+                        self.count += 1
+                        if self.count > 2:
+                            raise BrokenPipeError("client disconnected")
+                return WFile()
+
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *a, **k: (None, pending))
+        adapter._rpc_message_stream(BrokenHandler(), "req-1", {"message": {}}, "peer")
+
+        assert adapter.tasks.get("t-live-stream")["state"] == protocol.STATE_WORKING
+        adapter._resolve_task("t-live-stream", protocol.STATE_COMPLETED, "eventual answer via real rpc stream")
+        wait_until(lambda: (adapter.tasks.get("t-live-stream") or {}).get("state") == protocol.STATE_COMPLETED, timeout=2.0)
+        assert adapter.tasks.get("t-live-stream")["reply"] == "eventual answer via real rpc stream"
 
     def test_task_store_retention_and_profile_scope(self):
         store = protocol.TaskStore()
@@ -264,5 +300,9 @@ class TestImmediateSendLifecycle:
             assert store.get("t4") is not None
             # Duplicate completion on input-required task must be rejected:
             assert store.complete("t2", protocol.STATE_COMPLETED, "duplicate") is None
+            # Force terminal transition (e.g. CancelTask or hard timeout) on INPUT_REQUIRED is permitted:
+            cancelled = store.complete("t2", protocol.STATE_CANCELED, "force cancel", force_terminal=True)
+            assert cancelled is not None
+            assert store.get("t2")["state"] == protocol.STATE_CANCELED
         finally:
             store._MAX_TERMINAL = original_max

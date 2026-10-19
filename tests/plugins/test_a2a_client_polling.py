@@ -207,6 +207,23 @@ class TestA2aClientPolling:
         assert "receipt finalized" in out
         assert any(p[1] == "agent" and p[2] == "receipt finalized" and p[3] == "task-receipt" for p in persisted)
 
+    def test_a2a_orchestrate_best_mode_selects_successful_peer(self, monkeypatch):
+        monkeypatch.setattr(tools, "_configured_peers", lambda: {
+            "p1": {"url": "http://p1.internal", "capabilities": ["math"]},
+            "p2": {"url": "http://p2.internal", "capabilities": ["math"]},
+        })
+        monkeypatch.setattr(tools, "_fetch_card", lambda url, h, t: {"url": url, "supportedInterfaces": [{"protocolBinding": "JSONRPC", "url": url + "/rpc"}]})
+
+        def fake_post(url, body, h, t):
+            ans = "short" if "p1" in url else "very long detailed correct answer"
+            return {"result": {"task": {"id": "t-ok", "contextId": "ctx-ok", "status": {"state": "TASK_STATE_COMPLETED"},
+                                           "artifacts": [{"parts": [{"text": ans}]}]}}}
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        res = tools.a2a_orchestrate({"capability": "math", "message": "solve", "mode": "best"})
+        assert "[best: p2]" in res
+        assert "very long detailed correct answer" in res
+
     def test_a2a_orchestrate_classifies_polling_error_as_failure(self, monkeypatch):
         monkeypatch.setattr(tools, "_configured_peers", lambda: {
             "p-error": {"url": "http://p-error.internal", "capabilities": ["calc"]},
