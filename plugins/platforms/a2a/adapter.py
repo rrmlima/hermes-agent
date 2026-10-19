@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from contextvars import copy_context
 import hashlib
 import json
 import logging
@@ -243,6 +244,9 @@ class A2AAdapter(BasePlatformAdapter):
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("a2a"))
+        # HTTP and settlement threads do not inherit the gateway's profile context.
+        # Keep a template captured at adapter construction; each worker gets its own copy.
+        self._profile_context = copy_context()
         extra = getattr(config, "extra", {}) or {}
         # Scope-aware: a secondary multiplex profile must not borrow the default profile's bridged
         # A2A_PORT (falls closed to the module default). advertised_toolsets is deliberately unscoped.
@@ -324,12 +328,8 @@ class A2AAdapter(BasePlatformAdapter):
                 self._httpd.shutdown()
                 self._httpd.server_close()
             self._httpd = None
-        # Fail any in-flight replies so blocked HTTP threads don't hang.
+        # Clean request-ownership without failing in-flight agent turns prematurely.
         with self._pending_lock:
-            for tid in list(self._pending):
-                self._resolve_locked(tid, protocol.STATE_FAILED, "[agent shutting down]")
-            self._pending.clear()
-            self._pending_order.clear()
             self._active_tasks.clear()
 
     def _watchdog_loop(self) -> None:
@@ -340,14 +340,23 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("A2A: watchdog error", exc_info=True)
 
+    def _task_timeout(self) -> float:
+        extra = getattr(self.config, "extra", {}) or {}
+        try:
+            val = float(extra.get("task_timeout", 3600))
+            return min(86400.0, max(max(300.0, _reply_timeout()), val))
+        except (ValueError, TypeError):
+            return 3600.0
+
     def _fail_orphans_once(self) -> list[str]:
-        """Fail stale tasks that no request still owns."""
+        """Fail stale tasks that no request still owns, or tasks exceeding task_timeout."""
         with self._pending_lock:
             active_tasks = set(self._active_tasks)
         timeout = _orphan_timeout()
-        failed = self.tasks.fail_orphans(timeout, exclude=active_tasks)
+        hard_timeout = self._task_timeout()
+        failed = self.tasks.fail_orphans(timeout, exclude=active_tasks, hard_timeout=hard_timeout)
         for tid in failed:
-            logger.warning("A2A: orphaned task %s marked failed (timeout %gs)", tid, timeout)
+            logger.warning("A2A: orphaned/timed-out task %s marked failed", tid)
             protocol.metrics.tasks_failed += 1
         return failed
 
@@ -629,15 +638,12 @@ class A2AAdapter(BasePlatformAdapter):
         """Record a dispatched task's outcome; returns (state, reply) after redaction and
         input-required detection (a leading marker flags a clarification request)."""
         task_id, context_id, peer = pending["task_id"], pending["context_id"], pending["peer"]
-        try:
-            reply = security.redact_outbound(reply or "")
-            stripped = reply.lstrip()
-            if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
-                state, reply = protocol.STATE_INPUT_REQUIRED, stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
-            self._record_outcome(task_id, context_id, peer, state, reply, started=pending["started"])
-            return state, reply
-        finally:
-            self._pop_pending(task_id)
+        reply = security.redact_outbound(reply or "")
+        stripped = reply.lstrip()
+        if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
+            state, reply = protocol.STATE_INPUT_REQUIRED, stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
+        self._record_outcome(task_id, context_id, peer, state, reply, started=pending["started"])
+        return state, reply
 
     @staticmethod
     def _await_future(fut: Future, deadline: float, keepalive, on_timeout: tuple[str, str]) -> tuple[str, str]:
@@ -661,11 +667,71 @@ class A2AAdapter(BasePlatformAdapter):
         return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
+    def _watch_pending_task(self, pending: dict) -> None:
+        """Finalize a returnImmediately task when its agent turn produces a result.
+
+        The Future callback may run on the gateway event loop (inside send()), so only
+        enqueue settlement here; persistence and push delivery run in a daemon thread
+        bound to this adapter's profile context.
+        """
+        task_id = pending["task_id"]
+
+        def on_done(completed: Future) -> None:
+            try:
+                state, reply = completed.result()
+            except Exception:
+                state, reply = protocol.STATE_FAILED, "[agent processing failed]"
+
+            profile_context = self._profile_context.copy()
+
+            def settle() -> None:
+                try:
+                    self._finalize_task(pending, state, reply)
+                except Exception:
+                    logger.error("A2A: settlement failed for task %s", task_id, exc_info=True)
+                finally:
+                    self._pop_pending(task_id)
+
+            _daemon_thread(lambda: profile_context.run(settle), f"a2a-settle-{task_id}")
+
+        pending["future"].add_done_callback(on_done)
+
+    def _pending_task_snapshot(self, pending: dict, agent: Optional[dict]) -> dict:
+        task_id = pending["task_id"]
+        rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+        task = protocol.TaskStore.to_task(rec) if rec else None
+        if task:
+            if task.get("status", {}).get("state") == protocol.STATE_WORKING:
+                task["status"]["message"] = protocol.text_message(protocol.ROLE_AGENT, "still working; poll GetTask id=" + task_id, pending["context_id"])
+            return task
+        return protocol.build_task(task_id, pending["context_id"], protocol.STATE_WORKING,
+                                   "still working; poll GetTask id=" + task_id,
+                                   created_at=pending["created_iso"])
+
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
-            state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+            if protocol.return_immediately(params):
+                self._watch_pending_task(pending)
+                task = self._pending_task_snapshot(pending, agent)
+            else:
+                wait_result = self._await_reply(pending)
+                if pending["future"].done():
+                    try:
+                        outcome = pending["future"].result()
+                    except Exception:
+                        outcome = wait_result
+                    try:
+                        state, reply = self._finalize_task(pending, *outcome)
+                    finally:
+                        self._pop_pending(pending["task_id"])
+                    task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply,
+                                               created_at=pending["created_iso"])
+                else:
+                    # A response deadline is not the agent-turn deadline. Keep ownership and
+                    # let GetTask observe the eventual result instead of storing a false FAILED.
+                    self._watch_pending_task(pending)
+                    task = self._pending_task_snapshot(pending, agent)
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod
@@ -709,12 +775,18 @@ class A2AAdapter(BasePlatformAdapter):
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
-            state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
+            try:
+                state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
+            finally:
+                self._pop_pending(task_id)
             pending = None
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             if pending is not None:
-                self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
+                try:
+                    self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
+                finally:
+                    self._pop_pending(pending["task_id"])
             logger.debug("A2A: stream client disconnected")
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
@@ -724,6 +796,8 @@ class A2AAdapter(BasePlatformAdapter):
             return handler._json(200, error)
         self._sse_headers(handler)
         try:
+            # Emit initial task snapshot first as mandated by v1.0
+            self._sse_write(handler, protocol.sse_data(protocol.stream_task(protocol.TaskStore.to_task(rec)), req_id))
             if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent))) is None:
                 return self._sse_write(handler, protocol.sse_done())
             state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
@@ -762,7 +836,8 @@ class A2AAdapter(BasePlatformAdapter):
             return _err(req_id, protocol.ERR_TASK_NOT_CANCELABLE, f"task {task_id} already {rec['state']}")
         self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
         self._turns.reset(rec["context_id"])
-        self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+        # Do not resolve active Future to avoid contaminating next turns in context;
+        # let eventual turn settlement record late/ignore.
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
         return _ok(req_id, protocol.TaskStore.to_task(rec))
 
